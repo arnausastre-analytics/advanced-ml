@@ -1,16 +1,8 @@
-# 🔮 Forecasting Multivariado con Deep Learning (LSTM)
+# Forecasting Multivariado con Deep Learning (LSTM)
 
 Este proyecto implementa un modelo avanzado de predicción de demanda multivariada usando redes neuronales LSTM. El sistema predice la **demanda futura de productos (multistep)** considerando múltiples variables: precio, promociones, festivos, estacionalidad, etc.
 
----
-
-## 🎯 Objetivo del proyecto
-
-> “Predecimos la demanda futura de productos considerando múltiples señales para que puedas **optimizar tus inventarios, producción y logística**.”
-
----
-
-## 🧠 ¿Qué soluciona?
+## ¿Qué soluciona?
 
 - Predicción de demanda a 7 días vista (multistep)
 - Adaptación a múltiples variables predictoras (precio, promos…)
@@ -18,18 +10,14 @@ Este proyecto implementa un modelo avanzado de predicción de demanda multivaria
 - Preparación ante picos de demanda (festivos, promociones)
 - Visualización y análisis detallado de los errores de predicción
 
----
-
-## 🛠️ Tecnologías utilizadas
+## Tecnologías utilizadas
 
 - `Python`, `NumPy`, `Pandas`
 - `TensorFlow / Keras` – LSTM multistep
 - `Scikit-learn` – preprocesado y métricas
 - `Matplotlib`, `Seaborn` – visualización técnica y explicativa
 
----
-
-## 📦 Simulación de datos (entorno realista)
+## Simulación de datos (entorno realista)
 
 Se genera un dataset sintético con estructura realista:
 
@@ -40,9 +28,7 @@ Se genera un dataset sintético con estructura realista:
 
 Se introducen **componentes de estacionalidad y ruido** para reflejar la realidad operativa de retail o consumo.
 
----
-
-## 🧱 Arquitectura del modelo
+## Arquitectura del modelo
 
 - Normalización por separado para `features` y `target`
 - Conversión a formato `secuencia → predicción multistep`
@@ -50,14 +36,12 @@ Se introducen **componentes de estacionalidad y ruido** para reflejar la realida
 - Evaluación por paso de predicción
 - Visualización por cliente individual
 
----
+## Ejemplo de resultados
 
-## 📈 Ejemplo de resultados
+Datos preparados: X = (1346, 30, 4), y = (1346, 7)
+MSE: 28.42, MAE: 4.13
 
-✅ Datos preparados: X = (1346, 30, 4), y = (1346, 7)
-📊 MSE: 28.42, MAE: 4.13
-
-🎯 Error por paso:
+Error por paso:
 
 t+1 → MAE = 3.12
 
@@ -65,52 +49,28 @@ t+4 → MAE = 4.91
 
 t+7 → MAE = 5.88
 
-
-![Predicción multistep](https://user-images.githubusercontent.com/example/path-to-graph.png)
-
----
-
 ## 📊 Visualizaciones incluidas
 
-- 📉 Curva de error por horizonte de predicción (t+1 → t+7)
-- 👤 Predicciones multistep por cliente
-- 🧩 Gráficos de comparativa real vs. predicho
+- Curva de error por horizonte de predicción (t+1 → t+7)
+- Predicciones multistep por cliente
+- Gráficos de comparativa real vs. predicho
 
----
-
-## 📁 Estructura del proyecto
+## Estructura del proyecto
 
 ├── forecasting_lstm.ipynb # Notebook principal
+
 ├── README.md # Este archivo
 
-
----
-
-## 💼 Aplicaciones reales
+## Aplicaciones reales
 
 - Retail: predicción de ventas por SKU o categoría
 - Energía: consumo eléctrico por hora/día/cliente
 - Logística: predicción de demanda de transporte o stock
 - Producción: planificación de turnos según demanda estimada
 
----
-
-## 🚀 Cómo usar
+## Cómo usar
 
 1. Ejecuta el notebook en Google Colab.
 2. Visualiza las predicciones multistep.
 3. Sustituye el dataset simulado por tus datos reales.
 4. Ajusta variables predictoras según tu caso de negocio.
-
----
-
-## 📬 Contacto
-
-¿Te interesa predecir demanda futura o consumo en tu empresa?
-
-**[Tu Nombre]** – Freelance Data Scientist  
-📧 tu.email@ejemplo.com  
-🔗 [Tu LinkedIn]  
-🌍 [Tu Web o Portfolio]
-
----
