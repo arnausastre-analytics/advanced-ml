@@ -74,7 +74,7 @@ Gráficos:
 - SaaS: pruebas de precios por segmento o canal.
 - Publicidad online: optimiza oferta vs click-through rate.
 
-## 🚀 Cómo usar
+## Cómo usar
 
 1. Abre el notebook en Google Colab o Jupyter.
 2. Ejecuta todas las celdas.
