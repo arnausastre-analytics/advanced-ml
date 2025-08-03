@@ -49,7 +49,7 @@ t+4 → MAE = 4.91
 
 t+7 → MAE = 5.88
 
-## 📊 Visualizaciones incluidas
+## Visualizaciones incluidas
 
 - Curva de error por horizonte de predicción (t+1 → t+7)
 - Predicciones multistep por cliente
