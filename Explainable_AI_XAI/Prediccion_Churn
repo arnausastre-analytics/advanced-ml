@@ -1,1 +1,450 @@
+# scripts/churn_xai_pipeline.py
+# ==============================================================
+# Churn Prediction con XGBoost/LightGBM + XAI (SHAP)
+# - Carga CSV o simula dataset realista de suscriptores
+# - Preprocesado (num/cat), imputación, escalado, OHE
+# - Búsqueda de modelo (XGBoost/LightGBM/LogReg) por AUC-PR
+# - Calibración de probabilidades
+# - Umbral óptimo por valor de negocio (LTV vs coste de retención)
+# - Explicabilidad: importancias globales y SHAP global/local
+# - Salidas: modelo, métricas, gráficos y reporte ejecutivo
+# ==============================================================
+
+import os
+import sys
+import json
+import math
+import time
+import argparse
+import logging
+from dataclasses import dataclass
+from typing import Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split, StratifiedKFold, RandomizedSearchCV
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, precision_recall_curve, roc_curve,
+    confusion_matrix, classification_report
+)
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.utils.class_weight import compute_class_weight
+from joblib import dump
+
+# Modelos gradiente
+XGB_OK = False
+LGB_OK = False
+try:
+    from xgboost import XGBClassifier
+    XGB_OK = True
+except Exception:
+    pass
+try:
+    from lightgbm import LGBMClassifier
+    LGB_OK = True
+except Exception:
+    pass
+
+# SHAP (opcional)
+SHAP_OK = False
+try:
+    import shap
+    SHAP_OK = True
+except Exception:
+    pass
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+
+# -------------------------- Utils -----------------------------
+def setup_logger():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S"
+    )
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def save_json(data: Dict[str, Any], path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# ------------------- Load / Simulate data ---------------------
+def load_or_simulate(data_dir: str, n: int = 30000) -> pd.DataFrame:
+    """
+    Espera data/customers.csv con:
+      churn (0/1), tenure_months, monthly_fee, age, income, support_tickets,
+      avg_session_min, last_login_days, country, device, plan, autopay, discount_pct
+      y fechas opcionales: signup_date, last_login_date
+    Si no existe, simula dataset realista B2C de suscripciones.
+    """
+    ensure_dir(data_dir)
+    path = os.path.join(data_dir, "customers.csv")
+    if os.path.exists(path):
+        logging.info(f"Leyendo {path}")
+        df = pd.read_csv(path)
+        for c in ["signup_date", "last_login_date"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+        return df
+
+    logging.info("No hay CSV; simulando dataset de clientes...")
+    n = int(n)
+
+    # Demografía y cuenta
+    df = pd.DataFrame({
+        "customer_id": np.arange(1, n + 1),
+        "age": np.random.normal(38, 11, n).clip(18, 85).round(0),
+        "income": np.random.normal(28000, 12000, n).clip(9000, 120000).round(0),
+        "country": np.random.choice(["ES","FR","DE","IT","PT","GB","US"], size=n, p=[.37,.12,.12,.15,.08,.10,.06]),
+        "device": np.random.choice(["android","ios","web"], size=n, p=[.52,.32,.16]),
+        "plan": np.random.choice(["basic","standard","premium"], size=n, p=[.45,.38,.17]),
+        "autopay": np.random.choice([0,1], size=n, p=[.35,.65]),
+        "discount_pct": np.random.choice([0,5,10,20], size=n, p=[.5,.2,.2,.1]),
+        "monthly_fee": 0.0,
+    })
+
+    # Precio según plan (+ descuento)
+    base_fee = {"basic":9.9,"standard":14.9,"premium":24.9}
+    df["monthly_fee"] = df["plan"].map(base_fee) * (1 - df["discount_pct"]/100)
+
+    # Actividad y soporte
+    df["avg_session_min"] = np.random.gamma(shape=2.4, scale=15, size=n).round(1)
+    df["support_tickets"] = np.random.poisson(lam=0.35, size=n)
+    df["last_login_days"] = np.random.randint(0, 60, size=n)
+
+    # Antigüedad
+    df["tenure_months"] = np.random.randint(1, 48, size=n)
+
+    # Probabilidad de churn: factores de riesgo
+    base = 0.08
+    risk_low_eng = (df["avg_session_min"] < 15).astype(int)*0.08
+    risk_many_tickets = (df["support_tickets"] >= 3).astype(int)*0.06
+    risk_no_autopay = (df["autopay"] == 0).astype(int)*0.07
+    risk_high_price = (df["monthly_fee"] > 18).astype(int)*0.03
+    risk_new = (df["tenure_months"] < 3).astype(int)*0.05
+    risk_inactive = (df["last_login_days"] > 21).astype(int)*0.09
+    risk_device_web = (df["device"] == "web").astype(int)*0.02
+
+    p = base + risk_low_eng + risk_many_tickets + risk_no_autopay + risk_high_price + risk_new + risk_inactive + risk_device_web
+    p = np.clip(p, 0.01, 0.75)
+    df["churn"] = (np.random.rand(n) < p).astype(int)
+
+    # Fechas (opcionales)
+    start = pd.Timestamp("2023-01-01")
+    df["signup_date"] = start + pd.to_timedelta(np.random.randint(0, 360, size=n), unit="D")
+    df["last_login_date"] = pd.to_datetime("today") - pd.to_timedelta(df["last_login_days"], unit="D")
+
+    return df
+
+
+# ----------------------- Features -----------------------------
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Derivadas temporales (si hay fechas)
+    if "signup_date" in df.columns:
+        df["signup_year"] = pd.to_datetime(df["signup_date"]).dt.year
+        df["signup_month"] = pd.to_datetime(df["signup_date"]).dt.month
+    # ARPU ~ monthly_fee
+    df["arpu"] = df["monthly_fee"]
+
+    # Engagement binario
+    df["low_engagement"] = (df["avg_session_min"] < 15).astype(int)
+    df["inactive_30d"] = (df["last_login_days"] >= 30).astype(int)
+
+    # Transformaciones
+    df["log_income"] = np.log1p(df["income"])
+    df["log_session"] = np.log1p(df["avg_session_min"])
+
+    return df
+
+
+def split_train_valid_test(df: pd.DataFrame, test_size=0.2, valid_size=0.2) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split estratificado: train / valid / test."""
+    train_full, test = train_test_split(df, test_size=test_size, stratify=df["churn"], random_state=RANDOM_STATE)
+    train, valid = train_test_split(train_full, test_size=valid_size, stratify=train_full["churn"], random_state=RANDOM_STATE)
+    return train, valid, test
+
+
+# -------------------- Preprocess + Models ---------------------
+def build_preprocessor(train: pd.DataFrame):
+    num_cols = ["tenure_months","monthly_fee","age","income","avg_session_min","support_tickets",
+                "last_login_days","discount_pct","arpu","log_income","log_session"]
+    cat_cols = ["country","device","plan","autopay","low_engagement","inactive_30d"]
+    # imputación + escalado numérico, OHE categórico
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), num_cols),
+            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
+                              ("ohe", OneHotEncoder(handle_unknown="ignore", min_frequency=50 if len(train)>20000 else 5))]), cat_cols)
+        ]
+    )
+    return pre, num_cols, cat_cols
+
+
+def candidate_models(y_train: np.ndarray):
+    """Devuelve lista (name, estimator, param_distributions)."""
+    cw = compute_class_weight(class_weight="balanced", classes=np.array([0,1]), y=y_train)
+    class_weight = {0: float(cw[0]), 1: float(cw[1])}
+    models = []
+
+    # Logistic Regression (baseline)
+    lr = LogisticRegression(max_iter=1000, class_weight=class_weight)
+    lr_params = {
+        "clf__C": np.logspace(-3, 2, 25),
+        "clf__penalty": ["l2"],
+        "clf__solver": ["lbfgs"]
+    }
+    models.append(("LogReg", lr, lr_params))
+
+    # LightGBM
+    if LGB_OK:
+        lgb = LGBMClassifier(random_state=RANDOM_STATE, n_estimators=800, class_weight="balanced")
+        lgb_params = {
+            "clf__num_leaves": [31, 63, 127],
+            "clf__max_depth": [-1, 6, 10],
+            "clf__learning_rate": [0.03, 0.06, 0.1],
+            "clf__subsample": [0.7, 0.9, 1.0],
+            "clf__colsample_bytree": [0.7, 0.9, 1.0],
+            "clf__min_child_samples": [10, 20, 50]
+        }
+        models.append(("LightGBM", lgb, lgb_params))
+
+    # XGBoost
+    if XGB_OK:
+        pos_ratio = (y_train==0).sum() / max(1,(y_train==1).sum())
+        xgb = XGBClassifier(
+            random_state=RANDOM_STATE, n_estimators=800, eval_metric="logloss",
+            tree_method="hist", scale_pos_weight=pos_ratio, n_jobs=-1
+        )
+        xgb_params = {
+            "clf__max_depth": [3, 4, 6, 8],
+            "clf__learning_rate": [0.03, 0.06, 0.1],
+            "clf__subsample": [0.7, 0.9, 1.0],
+            "clf__colsample_bytree": [0.7, 0.9, 1.0],
+            "clf__min_child_weight": [1, 3, 5],
+            "clf__gamma": [0, 0.5, 1.0]
+        }
+        models.append(("XGBoost", xgb, xgb_params))
+
+    return models
+
+
+def fit_select(pre: ColumnTransformer, X_tr, y_tr, X_va, y_va):
+    """Busca mejor modelo por AUC-PR (valid)."""
+    best = {"name": None, "model": None, "ap": -np.inf, "roc": -np.inf, "p_valid": None}
+
+    for name, clf, params in candidate_models(y_tr):
+        logging.info(f"Buscando hiperparámetros: {name}")
+        pipe = Pipeline([("pre", pre), ("clf", clf)])
+        rcv = RandomizedSearchCV(
+            pipe, param_distributions=params, n_iter=25 if name!="LogReg" else 15,
+            scoring="average_precision", cv=StratifiedKFold(n_splits=4, shuffle=True, random_state=RANDOM_STATE),
+            n_jobs=-1, random_state=RANDOM_STATE, verbose=0
+        )
+        rcv.fit(X_tr, y_tr)
+        p = rcv.predict_proba(X_va)[:,1]
+        ap = average_precision_score(y_va, p)
+        roc = roc_auc_score(y_va, p)
+        logging.info(f"{name}: AUC-PR={ap:.4f} | ROC-AUC={roc:.4f}")
+        if ap > best["ap"]:
+            best = {"name": name, "model": rcv.best_estimator_, "ap": ap, "roc": roc, "p_valid": p}
+
+    logging.info(f"Mejor modelo: {best['name']} (AUC-PR={best['ap']:.4f})")
+    return best
+
+
+# --------------- Threshold by Business Value ------------------
+def optimize_threshold(y_true, p, ltv=150.0, retention_cost=5.0) -> Dict[str, Any]:
+    """
+    Umbral que maximiza valor esperado por contacto:
+      Valor = TP*LTV - FP*retention_cost
+    """
+    prec, rec, th = precision_recall_curve(y_true, p)
+    thresholds = np.r_[0.0, th, 1.0]
+    values = []
+    best_idx = 0
+    for i, t in enumerate(thresholds):
+        yhat = (p >= t).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, yhat).ravel()
+        value = tp * ltv - fp * retention_cost
+        values.append(value)
+        if value >= values[best_idx]:
+            best_idx = i
+    return {"threshold": float(thresholds[best_idx]), "expected_value": float(values[best_idx]), "points": len(thresholds)}
+
+
+# -------------------- Explainability / Plots ------------------
+def feature_names_from_pre(pre: ColumnTransformer, num_cols, cat_cols):
+    ohe = pre.named_transformers_["cat"].named_steps["ohe"]
+    return list(num_cols) + list(ohe.get_feature_names_out(cat_cols))
+
+def export_importances(model: Pipeline, feat_names: list, out_csv: str, out_png: str):
+    try:
+        clf = model.named_steps["clf"]
+        if hasattr(clf, "feature_importances_"):
+            imp = clf.feature_importances_
+            df = pd.DataFrame({"feature": feat_names, "importance": imp}).sort_values("importance", ascending=False)
+            df.to_csv(out_csv, index=False)
+            plt.figure(figsize=(8,10))
+            top = df.head(25)
+            plt.barh(top["feature"][::-1], top["importance"][::-1])
+            plt.title("Top Importancias (modelo de árboles)")
+            plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+    except Exception:
+        pass
+
+def export_shap(model: Pipeline, X_sample: pd.DataFrame, out_png: str):
+    if not SHAP_OK: return
+    try:
+        clf = model.named_steps["clf"]
+        pre = model.named_steps["pre"]
+        X_enc = pre.transform(X_sample)
+        explainer = shap.TreeExplainer(clf) if hasattr(clf, "get_booster") or hasattr(clf, "estimators_") else None
+        if explainer is None: return
+        shap_values = explainer.shap_values(X_enc)
+        plt.figure()
+        shap.summary_plot(shap_values, X_enc, show=False, plot_size=(8,6))
+        plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+    except Exception:
+        pass
+
+def export_curves(outdir, name, y_va, p_va, y_te, p_te, threshold):
+    # PR y ROC (valid)
+    prec, rec, _ = precision_recall_curve(y_va, p_va)
+    fpr, tpr, _ = roc_curve(y_va, p_va)
+
+    plt.figure(figsize=(6,4)); plt.plot(rec, prec)
+    plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(f"PR (valid) – {name}")
+    plt.tight_layout(); plt.savefig(os.path.join(outdir, "pr_valid.png"), dpi=150); plt.close()
+
+    plt.figure(figsize=(6,4)); plt.plot(fpr, tpr)
+    plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title(f"ROC (valid) – {name}")
+    plt.tight_layout(); plt.savefig(os.path.join(outdir, "roc_valid.png"), dpi=150); plt.close()
+
+    # Confusion (test)
+    yhat = (p_te >= threshold).astype(int)
+    cm = confusion_matrix(y_te, yhat)
+    fig, ax = plt.subplots(figsize=(4,4))
+    im = ax.imshow(cm, cmap="Purples")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(["Stay","Churn"]); ax.set_yticklabels(["Stay","Churn"])
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, cm[i, j], ha="center", va="center")
+    ax.set_title("Matriz de confusión (test)")
+    plt.tight_layout(); plt.savefig(os.path.join(outdir, "confusion_test.png"), dpi=150); plt.close()
+
+
+# ------------------------------ Main --------------------------
+def main():
+    setup_logger()
+    parser = argparse.ArgumentParser(description="Churn Prediction with XAI")
+    parser.add_argument("--data-dir", default="data", help="Carpeta con customers.csv o vacía para simulación")
+    parser.add_argument("--outdir", default="artifacts_churn", help="Carpeta de salida")
+    parser.add_argument("--simulate-n", type=int, default=30000, help="Tamaño del dataset simulado si no hay CSV")
+    parser.add_argument("--ltv", type=float, default=150.0, help="€ de valor por cliente retenido")
+    parser.add_argument("--retention-cost", type=float, default=5.0, help="€ por contactar a un no churn (FP)")
+    args = parser.parse_args()
+
+    t0 = time.time()
+    ensure_dir(args.outdir)
+
+    # 1) Carga
+    df_raw = load_or_simulate(args.data_dir, n=args.simulate_n)
+
+    # 2) Features + split
+    df = build_features(df_raw)
+    train, valid, test = split_train_valid_test(df, test_size=0.2, valid_size=0.2)
+    target = "churn"
+    feats = [c for c in df.columns if c not in [target, "customer_id", "signup_date", "last_login_date"]]
+
+    X_tr, y_tr = train[feats], train[target].values
+    X_va, y_va = valid[feats], valid[target].values
+    X_te, y_te = test[feats], test[target].values
+
+    # 3) Preprocesador
+    pre, num_cols, cat_cols = build_preprocessor(train)
+
+    # 4) Selección de modelo
+    best = fit_select(pre, X_tr, y_tr, X_va, y_va)
+    best_model = best["model"]
+    p_va = best["p_valid"]
+    ap_va = average_precision_score(y_va, p_va)
+    roc_va = roc_auc_score(y_va, p_va)
+
+    # 5) Calibración en train+valid y evaluación en test
+    X_trva = pd.concat([X_tr, X_va], axis=0)
+    y_trva = np.concatenate([y_tr, y_va], axis=0)
+    cal = CalibratedClassifierCV(best_model, method="sigmoid", cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE))
+    cal.fit(X_trva, y_trva)
+    p_te = cal.predict_proba(X_te)[:,1]
+    ap_te = average_precision_score(y_te, p_te)
+    roc_te = roc_auc_score(y_te, p_te)
+
+    # 6) Umbral óptimo por valor de negocio (valid)
+    thr_info = optimize_threshold(y_va, p_va, ltv=args.ltv, retention_cost=args.retention_cost)
+    thr = thr_info["threshold"]
+
+    # 7) Explicabilidad
+    feat_names = feature_names_from_pre(best_model.named_steps["pre"], num_cols, cat_cols)
+    export_importances(best_model, feat_names,
+                       os.path.join(args.outdir, "feature_importance.csv"),
+                       os.path.join(args.outdir, "feature_importance.png"))
+    if SHAP_OK:
+        sample = X_te.sample(min(2000, len(X_te)), random_state=RANDOM_STATE)
+        export_shap(best_model, sample, os.path.join(args.outdir, "shap_summary.png"))
+
+    # 8) Plots y reporte
+    export_curves(args.outdir, best["name"], y_va, p_va, y_te, p_te, thr)
+
+    # 9) Artefactos y métricas
+    dump(cal, os.path.join(args.outdir, "churn_model_calibrated.joblib"))
+
+    metrics = {
+        "best_model": best["name"],
+        "ap_valid": float(ap_va), "roc_valid": float(roc_va),
+        "ap_test": float(ap_te),  "roc_test": float(roc_te),
+        "best_threshold": float(thr),
+        "valid_expected_value": float(thr_info["expected_value"]),
+        "class_rate_train": float(np.mean(y_tr)),
+        "class_rate_valid": float(np.mean(y_va)),
+        "class_rate_test":  float(np.mean(y_te)),
+        "n_train": int(len(train)), "n_valid": int(len(valid)), "n_test": int(len(test))
+    }
+    save_json(metrics, os.path.join(args.outdir, "metrics.json"))
+
+    # Reporte ejecutivo
+    md = []
+    md.append("# Churn Prediction – Reporte Ejecutivo\n")
+    md.append(f"- Modelo seleccionado: **{best['name']}**\n")
+    md.append(f"- AUC-PR (valid): **{metrics['ap_valid']:.4f}** · ROC-AUC (valid): **{metrics['roc_valid']:.4f}**\n")
+    md.append(f"- AUC-PR (test): **{metrics['ap_test']:.4f}** · ROC-AUC (test): **{metrics['roc_test']:.4f}**\n")
+    md.append(f"- Umbral óptimo (valor negocio): **{metrics['best_threshold']:.4f}**\n")
+    md.append(f"- Valor esperado (valid): **{metrics['valid_expected_value']:.2f} €**\n")
+    md.append("\n## Gráficos\n")
+    md.append("- `pr_valid.png`, `roc_valid.png`, `confusion_test.png`\n")
+    md.append("- `feature_importance.png` (global) y `shap_summary.png` (si disponible)\n")
+    with open(os.path.join(args.outdir, "report.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(md))
+
+    logging.info("=== Resumen Ejecutivo ===")
+    logging.info(json.dumps(metrics, indent=2))
+    logging.info(f"Artefactos en: {os.path.abspath(args.outdir)}")
+    logging.info(f"Duración total: {time.time()-t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
 
